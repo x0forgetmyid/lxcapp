@@ -7,6 +7,7 @@ reates independent storages for containers, that makes possible, for example, to
 lxcappcnt - Manages application containers. Reads config params from env vars and from centralized config file
 
 lxcappcnt11 - lxcappcnt, based on Debian 11 Bullseye, on  not on Debian 10 (beta)
+lxcappgatecnt - Manages application gateway containers. Creates containers, that may be VPN, TOR, SSH or any other incapsulators.
 lxcpkg - Script to install software into coontainers, that are created by firest script (not ready for this monent).
 lxcapp - Runs application, wait until it it's process is terminated, and performs delayed stop of container
 
