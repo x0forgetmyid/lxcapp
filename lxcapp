@@ -1,0 +1,137 @@
+#!/bin/bash
+if [[ -z "$1" ]]; then
+	echo "No app name!"
+	exit 1
+fi
+APP_NUM=0
+if [[ -n "$2" ]]; then
+	APP_NUM="$2"
+fi
+
+CONFIG_FILE="/etc/lxcapp/$1/lxcpkg.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+	echo "Config file not found!"
+	exit 3
+fi
+
+. $CONFIG_FILE
+
+USAGE_DIR="/run/user/$UID/lxc-app/used"
+USAGE_FILE="$USAGE_DIR/$APP_NAME.lock"
+
+LXC_NAME=`APP=${APP_NAME} lxcappcnt get-name $APP_NUM`
+if [[ -z "$LXC_NAME" ]]; then
+	echo "Instance doesn't exist!"
+	exit 2
+fi
+
+LXC_USER=user
+STOP_DELAY=60
+
+usage_get() {
+	mkdir -p $USAGE_DIR
+	usage=`cat $USAGE_FILE`
+	if [[ $usage =~ ^[0-9]*$ ]]; then
+		echo "usage_get: Counter corrent: $usage"
+	else
+		echo "usage_get Fix counter to zero: $usage"
+		echo 0 > $USAGE_FILE
+		usage=0
+	fi
+	return $usage
+}
+
+usage_increment() {
+        usage_get
+	i=$?
+	let "i=i+1"
+	if (( i <= 0 )); then
+		echo "usage_increment: corrent to one: $i"
+		i=1
+	fi
+	echo "usage_increment: $iusage"
+	echo $i > $USAGE_FILE
+	return $i
+}
+
+usage_decrement() {
+	usage_get
+	d=$?
+	let "d=d-1"
+	if (( d < 0 )); then
+		echo "usage_decrement: correct to zero $d"
+		d=0
+	fi
+	echo "usage_decrement: Decrement $d"
+        echo $d > $USAGE_FILE
+        return $d
+}
+
+start_lxc() {
+	res=`lxc list | grep $LXC_NAME | grep STOPPED`
+	if [ -z "$res" ]; then
+		echo "Container not stopped! Using existing session!"
+		echo "lxc list: $res"
+		return 0
+	else
+		lxc start $LXC_NAME
+		return $?
+	fi
+}
+
+run_app() {
+echo "Start container $LXC_NAME"
+echo "Run application in container"
+lxc exec $LXC_NAME su $LXC_USER <<EOSU
+$APP_CMD
+exit $?
+EOSU
+}
+
+stop_lxc() {
+	echo "Delayed container shutdown. Wait for 1 min"
+	for i in {1..60}
+	do
+		sleep 1
+		usage_get
+		u=$?
+		if (( u > 0 )); then
+			echo "App activated again. Cancel delayed container shutdown"
+			return 99
+		fi
+	done
+	echo "Shut down inactive container"
+	lxc stop $LXC_NAME
+}
+
+start_lxc_app() {
+	usage_get
+	u=$?
+
+	usage_increment
+	u=$?
+	echo "Start Increment: $u"
+	echo "Start: Start contaniner"
+
+	start_lxc
+	res=$?
+
+	if (( res != 0 )); then
+		echo "Rollback counter"
+		usage_decrement
+		return 1
+	fi
+
+	run_app
+
+	usage_decrement
+	u=$?
+
+	echo "Stop Decrement: $u"
+	if (( u == 0 )); then
+		echo "Stop unused container!"
+		stop_lxc
+	fi
+}
+
+start_lxc_app

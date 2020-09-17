@@ -1,0 +1,583 @@
+#!/bin/bash
+
+APP_NUM=0
+[[ -n "$2" ]] && APP_NUM=$2
+
+if [[ -z "${APP_NAME+x}" ]]; then
+        echo "You must specify app name APP_NAME environment variable!"
+        exit 98
+fi
+
+[[ -n "${VARS+x}" ]] && set -x
+
+CONFIG_FILE="/etc/lxcapp/lxcapp.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+	echo "Config file doesn't exist!"
+	exit 999
+fi
+. $CONFIG_FILE
+
+GWO="gw1"
+APP_NAME="${APP_NAME}"
+APP_INST_NAME="$APP_NAME-$APP_NUM-gate"
+LXC_NAME="${APP_PREFIX}-$APP_INST_NAME"
+NIC_NAME_IN="ve0$APP_NAME$APP_NUM$GWO"
+NIC_OUT_NAME="ve1$APP_NAME$APP_NUM$GWO"
+BRIDGE_OUT_NAME="br1$APP_NAME$APP_NUM$GWO"
+IMG_DIR="/opt/home/lxd/${APP_PREFIX}"
+MNT_DIR="/var/lxd/${APP_PREFIX}"
+#MNT_USER="/var/lxd/${APP_PREFIX}/$APP_INST_NAME.user"
+MNT_LXC="${MNT_DIR}/$APP_INST_NAME"
+#IMG_USER="${IMG_DIR}/$APP_INST_NAME.user.img"
+IMG_LXC="${IMG_DIR}/$APP_INST_NAME.img"
+WAIT_FILE="/tmp/${APP_PREFIX}-$APP_INST_NAME.wait"
+
+X_SOCKET="X0"
+X_DISPLAY=":0"
+
+RAW_IDMAP="both ${UID_HOST} ${UID_CNT}"
+PULSE_SOCKET="/run/user/${UID_HOST}/pulse"
+
+if [[ -n "${BRIDGE_NAME}" ]]; then
+	echo "Default bridge: ${BRIDGE_NAME}"
+	BRIDGE_NAME="${BRIDGE_NAME}"
+	if [[ -n "${ENABLE_NET}" ]]; then
+		echo "Network is enabled on new containers."
+		ENABLE_NET=1
+	else
+		echo "Netowork is disabled by default on new containers."
+	fi
+else
+	echo "Warning: no default bridge"
+fi
+
+[[ -z "${DEBUG+x}" ]] && set +x
+
+install_profile() {
+	echo "Install lxcapp common profile"
+	c=`lxc profile list | grep $LXC_GATE_PROFILE`
+	if [[ -z "$c" ]]; then
+		lxc profile create $LXC_GATE_PROFILE
+	fi
+	echo "Create base directories"
+	mkdir -p ${MNT_DIR}
+	mkdir -p ${IMG_DIR}
+
+}
+
+enable_net_in() {
+	lxc config device add $LXC_NAME eth0 nic name=eth0 host_name=$NIC_NAME_IN nictype=p2p
+}
+
+connect_net_in() {
+echo "[Match]" > /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Name=$NIC_NAME_IN" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "[Network]" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Bridge=$BRIDGE_NAME" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+networkctl reload
+lxc restart $LXC_NAME
+sleep 2
+networkctl renew $NIC_NAME
+}
+
+enable_net_out() {
+lxc config device add $LXC_NAME eth1 nic nictype=p2p host_name=$NIC_OUT_NAME name=eth1
+}
+
+disable_net_out() {
+lxc config device remove $LXC_NAME eth1
+}
+
+connect_net_out() {
+cat >/etc/systemd/network/lxc@$LXC_NAME.bridge.network <<EOL
+echo
+[Match]
+Name=$BRIDGE_OUT_NAME
+
+[Network]
+LinkLocalAddressing=no
+EOL
+
+cat >/etc/systemd/network/lxc@$LXC_NAME.bridge.netdev <<EOL
+[NetDev]
+Name=$BRIDGE_OUT_NAME
+Kind=bridge
+EOL
+
+cat >/etc/systemd/network/lxc@$LXC_NAME.out.network <<EOL
+[Match]
+Name=$NIC_OUT_NAME
+
+[Network]
+Bridge=$BRIDGE_OUT_NAME
+EOL
+
+networkctl reload
+networkctl renew $NIC_OUT_NAME
+}
+
+disconnect_net_out() {
+	rm -f /etc/systemd/network/lxc@$LXC_NAME.out.network
+	rm -f /etc/systemd/network/lxc@$LXC_NAME.bridge.netdev
+	rm -f /etc/systemd/network/lxc@$LXC_NAME.bridge.network 
+	systemctl reload
+	systemctl renew $NIC_OUT_NAME
+	systemctl renew $BRIDGE_OUT_NAME
+}
+
+disable_net_in() {
+lxc config device remove $LXC_NAME eth0
+}
+
+disconnect_net_in() {
+	rm -f /etc/systemd/network/lxc@$LXC_NAME.in.network
+	networkctl reload
+}
+
+enable_local_repo_apt() {
+lxc exec $LXC_NAME bash <<EOSH
+cp /etc/apt/sources.list /etc/apt/source.list.orig
+echo "deb file:/repo buster main" > /etc/apt/sources.list
+echo "deb http://security.debian.org/debian-security buster/updates main" >> /etc/apt/sources.list
+apt -y update
+EOSH
+}
+
+disable_local_repo_apt() {
+lxc exec $LXC_NAME bash <<EOSH
+cp /etc/apt/sources.list.orig /etc/apt/sources.list
+apt -y update
+EOSH
+}
+
+enable_local_repo() {
+	lxc config device add $LXC_NAME repo disk path=/repo source=$LOCAL_REPO_DIR
+}
+
+disable_local_repo() {
+	lxc config device remove $LXC_NAME repo
+}
+
+set_timezone() {
+   echo "$TIME_ZONE"
+   lxc exec $LXC_NAME "timedatectl set-timezone $1"
+}
+
+install_router() {
+lxc exec $LXC_NAME -- bash <<EOSH
+apt -y install isc-dhcp-server unbound openvpn iptables-persistent
+
+cat >/etc/unbound/unbound.conf <<EOL
+server:
+    username: unbound
+    access-control: 192.168.0.0/24 allow
+    interface: 192.168.0.1
+    cache-max-ttl: 14400
+    cache-min-ttl: 60
+    hide-identity: yes
+    hide-version: yes
+    minimal-responses: yes
+    prefetch: yes
+    qname-minimisation: yes
+    rrset-roundrobin: yes
+    use-caps-for-id: yes
+    do-tcp: yes
+#    ssl-upstream: yes
+forward-zone:
+    name: "."
+    forward-addr: 8.8.4.4
+    forward-addr: 8.8.8.8
+EOL
+
+cat >/lib/systemd/systemd/openvpn-client@.service <<EOL
+Description=OpenVPN tunnel for %I
+After=network-online.target
+Wants=network-online.target
+Documentation=man:openvpn(8)
+Documentation=https://community.openvpn.net/openvpn/wiki/Openvpn24ManPage
+Documentation=https://community.openvpn.net/openvpn/wiki/HOWTO
+
+[Service]
+Type=notify
+PrivateTmp=true
+WorkingDirectory=/etc/openvpn/client
+ExecStart=/usr/sbin/openvpn --suppress-timestamps --nobind --config %i.conf
+KillMode=process
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+cat >/etc/dhcp/dhcpd.conf <<EOL
+option domain-name "loco.local";
+default-lease-time 3000;
+authoritative;
+log-facility local7;
+subnet 192.168.0.0 netmask 255.255.255.0 # маска
+{
+    range 192.168.0.20 192.168.0.120;
+    option broadcast-address 192.168.0.255;
+    option routers 192.168.0.1;
+    option domain-name-servers 192.168.0.1;
+}
+EOL
+
+cat >/etc/default/dhcpd <<EOL
+DHCPDv4_CONF=/etc/dhcp/dhcpd.conf
+#DHCPDv6_CONF=/etc/dhcp/dhcpd6.conf
+#DHCPDv4_PID=/var/run/dhcpd.pid
+#DHCPDv6_PID=/var/run/dhcpd6.pid
+#OPTIONS=""
+INTERFACESv4="eth1"
+INTERFACESv6=""
+EOL
+
+
+cat >/etc/network/interfaces <<EOL
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+        
+auto eth1
+iface eth1 inet static
+        address 192.168.0.1
+        netmask 255.255.192.0
+
+source /etc/network/interfaces.d/*
+EOL
+systemctl daemon-reload
+systemctl enable dhcpd.service
+systemctl enable unbound.service
+EOSH
+}
+
+install_container() {
+res=`lxc list | grep $LXC_NAME`
+if [ -n "$res" ]; then
+	echo "Container exists! Uninstall it!"
+	exit 1
+fi
+#if [ -f "$IMG_USER" ]; then
+#    echo "Image user file exists!"
+#    exit 2
+#fi
+#if [ -f "$IMG_LXC" ]; then
+#    echo "Image file exist!"
+#    exit 3
+#fi
+
+install_profile
+
+if [[ -f "$IMG_LXC" ]]; then
+    echo "Image exists on install path: $IMG_LXC"
+    echo "Remove it (R - remove, Ctrl+C - quit)?"
+    read -p Q
+    [[ -n "$Q" ]] && exit 79
+    umount $MNT_LXC
+    #rm -f $IMG_LXC
+    #rm -rf $MNT_LXC
+    exit 79
+fi
+truncate -s 1G $IMG_LXC
+mkfs.ext4 -m0 $IMG_LXC
+truncate -s $IMG_SIZE $IMG_LXC
+e2fsck -f $IMG_LXC && resize2fs $IMG_LXC
+echo "$IMG_LXC $MNT_LXC ext4 loop 0 0" >> /etc/fstab
+mkdir -p $MNT_LXC
+mount $IMG_LXC $MNT_LXC
+sleep 5
+rm -rf $MNT_LXC/*
+read -p OKFDDF
+#ls $MNT_LXC/*
+#read -p PPPDF
+ls $MNT_LXC/*
+read -p Q
+lxc storage create $LXC_NAME dir source=$MNT_LXC
+lxc launch -s $LXC_NAME -p $LXC_GATE_PROFILE $LXC_GATE_IMAGE $LXC_NAME
+lxc config set $LXC_NAME raw.idmap "$RAW_IDMAP"
+lxc config set $LXC_NAME boot.autostart="false"
+lxc config set $LXC_NAME limits.cpu="1"
+lxc config set $LXC_NAME limits.cpu.allowance=10%
+lxc config set $LXC_NAME limits.memory=512MB
+lxc config set $LXC_NAME limits.memory.enforce=hard
+lxc config set $LXC_NAME limits.memory.swap="false"
+lxc config set $LXC_NAME limits.memory.swap.priority="0"
+lxc config device set $LXC_NAME root limits.read=4MB
+lxc config device set $LXC_NAME root limits.write=4MB
+if [[ -n "${ENABLE_NET}" ]]; then
+	enable_net_in
+	enable_net_out
+fi
+[[ -n "${ENABLE_LOCAL_REPO}" ]] && enable_local_repo
+#lxc config set $LXC_NAME environment.QT_X11_NO_MITSHM="1"
+lxc restart $LXC_NAME
+#[[ -n "${USER_CNT}" ]] && create_user
+if [[ -n "${CONNECT_NET}" ]]; then
+	connect_net_in
+	connect_net_out
+fi
+[[ -n "${ENABLE_LOCAL_REPO}" ]] && enable_local_repo_apt
+[[ -n "${COMMON_GATE_PACKAGES}" ]] && lxc exec $LXC_NAME "apt -y install ${COMMON_GATE_PACKAGES}"
+[[ -n "${ADDON_GATE_PACKAGES}" ]] && lxc exec $LXC_NAME "apt -y install ${ADDON_GATE_PACKAGES}"
+[[ -n "${GATE_HOST_NAME}" ]] && set_hostname ${HOST_NAME}
+[[ -n "${GATE_TIME_ZONE}" ]] && set_timezone ${TIME_ZONE}
+}
+
+stop() {
+    lxc stop $LXC_NAME
+}
+
+uninstall() {
+    stop
+    disconnect_net_in
+    lxc delete $LXC_NAME
+    lxc storage delete $LXC_NAME
+    umount $IMG_LXC
+    rm -f $IMG_LXC
+    rm -rf $MNT_LXC
+}
+
+reinstall() {
+    uninstall
+    install_container
+}
+
+lxc_config() {
+	lxc config edit $LXC_NAME
+}
+
+create_user() {
+lxc exec $LXC_NAME bash <<EOSH
+userdel ${USER_CNT}
+groupdel ${USER_CNT}
+groupadd --gid ${GID_CONTAINER} ${USER_CNT}
+useradd --uid ${UID_CNT} --gid ${GID_CONTAINER} -m -d /home/${USER_CNT} -s /bin/bash ${USER_CNT}
+EOSH
+}
+
+reconfigure() {
+    c=`lxc list | grep STOPPED | grep $LXC_NAME`
+    [[ -n "$ENABLE_X" ]] && enable_x
+    [[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo 
+    [[ -n "$ENABLE_NET" ]] && enable_net
+    [[ -z "$ENABLE_LOCAL_REPO" ]] && disable_local_repo
+    [[ -z "$ENABLE_NET" ]] && disable_net
+    [[ -n "$ENABLE_X" ]] && xhost +
+    [[ -z "$c" ]] && lxc start $LXC_NAME
+    [[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo_apt
+    [[ -n "$ENABLE_GPU" ]] && enable_gpu
+    [[ -n "$ENABLE_X" ]] && enable_x
+    [[ -n "$ENABLE_X" ]] && [[ -n "$X_PACKAGES" ]] && lxc exec $LXC_NAME "apt -y install $X_PACKAGES"
+    [[ -n "$ENABLE_PULSE" ]]  && enable_pulse
+    [[ -n "$ENABLE_PULSE" ]] && [[ -n "$PULSE_PACKAGES" ]] && lxc exec $LXC_NAME "apt -y install $X_PACKAGES"
+    [[ -n "$SET_HOSTNAME" ]] && lxc exec $LXC_NAME bash "hostnamectl set-hostname ${HOST_NAME}"
+    [[ -n "$TIME_ZONE" ]] && set_timezone $TIME_ZONE
+    [[ -z "$ENABLE_GPU" ]] && disable_gpu
+    [[ -z "$ENABLE_X" ]] && disable_x
+    [[ -z "$ENABLE_LOCAL_REPO" ]] && disable_local_repo
+    [[ -z "$ENABLE_NET" ]] && disable_net
+    [[ -n "$c" ]] && lxc stop $LXC_NAME
+}
+
+change_mac() {
+	disable_net
+	enable_net
+}
+
+set_hostname() {
+    lxc exec $LXC_NAME "hostnamectl set-hostname $1"
+    lxc exec $LXC_NAME reboot
+    sleep 3
+}
+
+set_bridge_in() {
+echo "[Match]" > /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Name=$NIC_NAME" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "[Network]" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Bridge=$1" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+networkctl reload
+lxc restart $LXC_NAME
+sleep 3
+networkctl renew $NIC_NAME
+sleep 2
+}
+
+set_bridge_out() {
+    echo 1
+}
+
+temp_home() {
+lxc exec $LXC_NAME bash <<EOSH
+mkdir -p /run/home/${USER_CNT}
+chmod 075 /run/home/${USER_CNT}
+chown -R ${USER_CNT}:${USER_CNT} /run/home/${USER_CNT}
+usermod -d /home/user/${USER_CNT} ${USER_CNT}
+EOSH
+}
+
+start() {
+    c=`lxc list | grep STOPPED | grep $LXC_NAME`
+    if [ -z "$c" ]; then
+	echo "Container already started!"
+	exit 99
+    fi
+    lxc start $LXC_NAME
+}
+
+user() {
+[[ -n "$TEMP_HOME" ]] && temp_home
+lxc exec $LXC_NAME -- su ${USER_CNT}
+}
+
+root() {
+    lxc exec $LXC_NAME bash
+}
+
+enable_net() {
+	enable_in_net
+	enable_out_net
+}
+
+connect_net() {
+	connect_in_net
+	connect_out_net
+}
+
+disable_net() {
+	disable_in_net
+	disable_out_net
+}
+
+add_ovpn_profile() {
+	lxc file push $1 $LXC_NAME/etc/openvpn/profiles
+}
+
+test_ovpn_profile() {
+lxc exec $LXC_NAME -- bash <<EOSH
+openvpn --config /etc/openvpn/profiles/$1
+exit $?
+EOSH
+}
+
+set_ovpn_profile() {
+lxc exec $LXC_NAME -- bash <<EOSH
+systemctl stop openvpn-client@router.service
+unlink /etc/openvpn/client/router.conf
+ln -s /etc/openvpn/profiles/Whoer_Netherlands_nl.ovpn /etc/openvpn/client/router.conf
+systemctl enable openvpn-client@router.service
+systemctl start openvpn-client@router.service
+systemctl status openvpn-client@router.service
+EOSH
+}
+
+unset_ovpn_profile() {
+lxc exec $LXC_NAME -- bash <<EOSH
+systemctl stop openvpn-client@router.service
+systemctl stop openvpn-client@router.service
+unlink /etc/openvpn/client/router.conf
+}
+
+
+case "$1" in
+    "install")
+        install_container
+        ;;
+    "install-router")
+	install_router
+	;;
+    "uninstall")
+        uninstall
+        ;;
+    "start")
+        start
+        ;;
+    "stop")
+        stop
+        ;;
+    "reconfigure")
+        check
+        ;;
+    "user")
+	user
+	;;
+    "root")
+	root
+	;;
+    "enable-x")
+	enable_x
+	;;
+    "enable-pulse")
+	enable_pulse
+	;;
+    "disable-x")
+	disable_x
+	;;
+    "disable-pulse")
+	disable_pulse
+	;;
+    "enable-net")
+	enable_net
+	;;
+    "connect-net")
+	connect_net
+	;;
+    "disable-net")
+	disable_net
+	;;
+    "disconnect-net")
+	disconnect_net
+	;;
+    "enable-net-out")
+	enable_net_out
+	;;
+    "connect-net-out")
+	connect_net_out
+	;;
+    "config")
+	lxc_config
+	;;
+    "set-hostname")
+	set_hostname $3
+	;;
+    "set-timezone")
+	set_timezone $3
+	;;
+    "change-mac")
+	change_mac
+	;;
+    "set-bridge")
+	set_bridge $3
+	;;
+    "create-user")
+	create_user
+	;;
+    "get-name")
+	echo "$LXC_NAME"
+	;;
+    "temp-home")
+	temp_home
+	;;
+    "temp-home")
+	restore_temp_home
+	;;
+    "add-ovpn-profile")
+	add_ovpn_profile
+	;;
+    "test-ovpn-profile")
+	test_ovpn_profile
+	;;
+    "set-vpn-profile")
+	set_vpn_profile
+	;;
+    "unset_ovpn_profile")
+	unset_ovpn_profile
+	;;
+
+    *)
+        echo "lxc-app-container install | uninstall | start | stop | check"
+        ;;
+esac

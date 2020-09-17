@@ -1,0 +1,151 @@
+#!/bin/bash
+
+set +x
+set -x
+install_tgz() {
+lxc exec $LXCNAME bash <<EOSH
+cd $INST_ROOT
+tar zxvf ${PACKAGE_FILE}
+chmod -R 0755 "${INST_FOLDER}"
+EOSH
+}
+
+install_deb() {
+lxc exec $LXCNAME bash <<EOSH
+cd $INST_ROOT
+dpkg -i ${PACKAGE_FILE}
+apt -y -f install
+EOSH
+}
+
+install_xz() {
+lxc exec ${LXCNAME} bash <<EOSH
+apt -y install xz-utils
+cd $INST_ROOT
+tar -xvJf "${PACKAGE_FILE}"
+}
+
+install_bz2() {
+lxc exec ${LXCNAME} bash <<EOSH
+apt -y install xz-utils
+cd $INST_ROOT
+tar -xvf "${PACKAGE_FILE}"
+}
+
+
+CONFIG_FILE="lxcpkg.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "No config!"
+    exit 99
+fi
+
+[[ -n "$1" ]] && CONFIG_FILE="$1"
+
+. $CONFIG_FILE
+
+INST_ROOT="/home/user"
+[[ -n "${INST_ROOT}" ]] && INST_ROOT="${INST_ROOT}"
+
+if [[ ! -n "${PACKAGE_FILE}" ]]; then
+    echo "No package config!"
+    exit 99
+fi
+
+if [[ -n "${PACKAGE_URL}" ]] && [[ ! -f "${PACKAGE_FILE}" ]]; then
+    echo "Trying to download package"
+    wget "${PACKAGE_URL}"
+fi
+
+if [[ ! -n "${APP_NAME}" ]]; then
+    echo "No app name!"
+    exit 99
+fi
+
+if [[ -n "${PACKAGE_FILE}" ]] && [[ -n "${PACKAGE_APT}" ]]; then
+    echo "You must specify PACKAGE_FILE to install from archive, or PACKAGE_APT to install from repo."
+    echo "No installation tasks!"
+    return 98
+fi
+
+APP_NUM=0
+LXCNAME=`APP=${APP_NAME} lxcappcnt get-name $APP_NUM`
+LXCE=`lxc list | grep $LXCNAME`
+[[ -n "$LXCE" ]] && APP_NUM=0
+while True :
+do
+	LXCNAME=`APP=${APP_NAME} lxcappcnt get_name $APP_NUM`
+	LXCE=`lxc list | grep $LXCNAME`
+	if [[ -n "$LXCE" ]]; then
+		echo "Instance number: $APP_NUM"
+		break
+	else
+		echo "$APP_NUM busy"
+		let "APP_NUM=APP_NUM+1"
+		sleep 1
+	fi
+done
+
+EXT=`echo "${PACKAGE_FILE}" | cut -d'.' -f2`
+if [[ ! -f ${PACKAGE_FILE} ]]; then
+    wget ${PACKAGE_URL}
+fi
+
+if [[ ! -f ${PACKAGE_FILE} ]] && [[ -z "${PACKAGE_APT}" ]]; then
+    exit 99
+fi
+
+echo "Installing container"
+APP=${APP_NAME} lxcappcnt install $APP_NUM
+
+echo "Push packge"
+lxc file push "${PACKAGE_FILE}" "$LXCNAME$INST_ROOT/${PACKAGE_FILE}"
+
+echo "Install into container"
+
+UNPACK_CNT=0
+#if [[ -n "${PACKAGE_APT}" ]]; then
+#    lxc exec $LXCNAME -- apt -y install "${PACKAGE_APT}"
+#    let "UNPACK_CNT+=1"
+#fi
+
+if [[ -n "${PACKAGE_FILE}" ]]; then
+    fullfile="${PACKAGE_FILE}"
+    EXT="${fullfile##*.}"
+    echo "Package type: $EXT"
+    case "$EXT" in
+	    "tar.gz")
+                install_tgz
+                ;;
+    	    "bz2")
+                install_bz2
+                ;;
+    	    "xz")
+                install_xz
+                ;;
+    	    "deb")
+                install_deb
+                ;;
+    	    *)
+                echo "Warning: Unknown pack type: $EXT"
+		let "UNPACK_CNT-=1"
+                ;;
+    esac
+fi
+
+if (( UNPACK_CNT <= 0 )); then
+    echo "Nothing is installed! Terminating!"
+    exit 97
+fi
+
+if [[ -n "${INST_SCRIPT}" ]]; then
+	chmod a+x ${INST_SCRIPT}
+        CMD="APP_NAME=${APP_NAME} ${INST_SCRIPT}"
+	$CMD
+fi
+
+[[ -n "${DEPS}" ]] && lxc exec $LXCNAME bash <<EOSH
+apt -y install "${DEPS}"
+EOSH
+
+echo "Ready!"
+exit 0

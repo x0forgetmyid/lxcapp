@@ -1,0 +1,503 @@
+#!/bin/bash
+
+[[ ! "$1" == "get_name" ]] && set -x
+
+APP_NUM=0
+[[ -n "$2" ]] && APP_NUM=$2
+
+if [[ -z "${APP_NAME+x}" ]]; then
+        echo "You must specify app name APP_NAME environment variable!"
+        exit 98
+fi
+
+[[ -n "${VARS+x}" ]] && set -x
+
+CONFIG_FILE="/etc/lxcapp/lxcapp.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+	echo "Config file doesn't exist!"
+	exit 999
+fi
+. $CONFIG_FILE
+
+APP_NAME="${APP_NAME}"
+APP_INST_NAME="$APP_NAME-$APP_NUM"
+
+if [[ -n "${LXC_NAME}" ]]; then
+	LXC_NAME="${LXC_NAME}"
+else
+	LXC_NAME="${APP_PREFIX}-$APP_INST_NAME"
+fi
+
+NIC_NAME="ve0$APP_NAME$APP_NUM"
+IMG_DIR="/opt/home/lxd/${APP_PREFIX}"
+MNT_DIR="/var/lxd/${APP_PREFIX}"
+MNT_USER="/var/lxd/${APP_PREFIX}/$APP_INST_NAME.user"
+MNT_LXC="${MNT_DIR}/$APP_INST_NAME"
+IMG_USER="${IMG_DIR}/$APP_INST_NAME.user.img"
+IMG_LXC="${IMG_DIR}/$APP_INST_NAME.img"
+WAIT_FILE="/tmp/${APP_PREFIX}-$APP_INST_NAME.wait"
+
+X_SOCKET="X0"
+X_DISPLAY=":0"
+
+RAW_IDMAP="both ${UID_HOST} ${UID_CNT}"
+PULSE_SOCKET="/run/user/${UID_HOST}/pulse"
+
+if [[ -n "${BRIDGE_NAME}" ]]; then
+	echo "Default bridge: ${BRIDGE_NAME}"
+	BRIDGE_NAME="${BRIDGE_NAME}"
+	if [[ -n "${ENABLE_NET}" ]]; then
+		echo "Network is enabled on new containers."
+		ENABLE_NET=1
+	else
+		echo "Netowork is disabled by default on new containers."
+	fi
+else
+	echo "Warning: no default bridge"
+fi
+
+#[[ -z "${DEBUG+x}" ]] && set +x
+
+install_profile() {
+	echo "Install lxcapp common profile"
+	c=`lxc profile list | grep $LXC_PROFILE`
+	if [[ -z "$c" ]]; then
+		lxc profile create $LXC_PROFILE
+	fi
+	echo "Create base directories"
+	mkdir -p ${MNT_DIR}
+	mkdir -p ${IMG_DIR}
+
+}
+
+enable_gpu() {
+	echo "Enable GPU"
+	lxc config device add $LXC_NAME mygpu gpu uid=${UID_HOST} gid=${GID_HOST}
+	lxc config set $LXC_NAME nvidia.driver.capabilities=all
+	lxc config set $LXC_NAME nvidia.runtime=true
+}
+
+disable_gpu() {
+	echo "Disable GPU"
+        lxc config device remove $LXC_NAME mygpu
+        lxc config unset $LXC_NAME nvidia.driver.capabilities=all
+        lxc config unset $LXC_NAME nvidia.runtime=true 
+}
+
+enable_x() {
+	echo "Enable X11"
+	if [ -n "$X_SOCKET" ]; then
+        	lxc config device add $LXC_NAME X11 proxy bind=container connect=unix:@/tmp/.X11-unix/$X_SOCKET listen=unix:@/tmp/.X11-unix/$X_SOCKET
+        	lxc config set $LXC_NAME environment.DISPLAY=":0"
+	fi
+}
+
+disable_x() {
+	echo "Disable X11"
+if [ -n "$X_SOCKET" ]; then
+	lxc config device remove $LXC_NAME X11
+	lxc config unset $LXC_NAME environment.DISPLAY
+fi
+}
+
+enable_pulse() {
+	echo "Enable PulseAudio"
+if [ -n "$PULSE_SOCKET" ]; then
+lxc exec $LXC_NAME bash <<EOSH
+sed -i "s/; enable-shm = yes/enable-shm = no/g" /etc/pulse/client.conf
+EOSH
+        lxc config device add $LXC_NAME pulse proxy bind=container connect=unix:$PULSE_SOCKET listen=unix:/home/${USER_CNT}/pulse-native mode=0777 uid=${UID_HOST} gid=${GID_HOST} security.uid=${UID_HOST} security.gid=${GID_HOST}
+        lxc config set $LXC_NAME environment.PULSE_SERVER=unix:/home/${USER_CNT}/pulse-native
+fi
+}
+
+disable_pulse() {
+	echo "Disable PulseAudio"
+if [ -n "$PULSE_SOCKET" ]; then 
+        lxc config device remove $LXC_NAME pulse
+        lxc config set $LXC_NAME environment.PULSE_SERVER
+fi
+}
+
+enable_net() {
+	lxc config device add $LXC_NAME eth0 nic name=eth0 host_name=$NIC_NAME nictype=p2p
+}
+
+connect_net() {
+echo "[Match]" > /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Name=$NIC_NAME" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "[Network]" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Bridge=$BRIDGE_NAME" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+networkctl reload
+lxc restart $LXC_NAME
+sleep 2
+networkctl renew $NIC_NAME
+}
+
+disable_net() {
+lxc config device remove $LXC_NAME eth0
+}
+
+disconnect_net() {
+	rm -f /etc/systemd/network/lxc@$LXC_NAME.in.network
+	networkctl reload
+}
+
+enable_local_repo_apt() {
+lxc exec $LXC_NAME bash <<EOSH
+cp /etc/apt/sources.list /etc/apt/source.list.orig
+echo "deb file:/repo buster main" > /etc/apt/sources.list
+echo "deb http://security.debian.org/debian-security buster/updates main" >> /etc/apt/sources.list
+apt -y update
+EOSH
+}
+
+disable_local_repo_apt() {
+lxc exec $LXC_NAME bash <<EOSH
+cp /etc/apt/sources.list.orig /etc/apt/sources.list
+apt -y update
+EOSH
+}
+
+enable_local_repo() {
+	lxc config device add $LXC_NAME repo disk path=/repo source=$LOCAL_REPO_DIR
+}
+
+disable_local_repo() {
+	lxc config device remove $LXC_NAME repo
+}
+
+set_timezone() {
+   echo "$TIME_ZONE"
+   lxc exec $LXC_NAME "timedatectl set-timezone $1"
+}
+
+create_storage() {
+truncate -s 1G $IMG_LXC
+mkfs.ext4 -m0 $IMG_LXC
+truncate -s $IMG_SIZE $IMG_LXC
+e2fsck -f $IMG_LXC && resize2fs $IMG_LXC
+echo "$IMG_LXC $MNT_LXC ext4 loop 0 0" >> /etc/lxcapp/mounts
+mkdir -p $MNT_LXC
+mount $IMG_LXC $MNT_LXC
+rm -rf "$MNT_LXC/*"
+mkdir -p $MNT_USER
+truncate -s 1G $IMG_USER
+mkfs.ext4 -m0 $IMG_USER
+truncate -s $USER_IMG_SIZE $IMG_USER
+e2fsck -f $IMG_USER && resize2fs $IMG_USER
+echo "$IMG_USER $MNT_USER ext4 loop 0 0" >> /etc/lxcapp/mounts
+sudo mount $IMG_USER $MNT_USER
+rm -rf "$MNT_LXC.user/*"
+chown ${UID_HOST}:${GID_HOST} $MNT_USER
+chmod 0755 $MNT_USER
+sleep 3
+rm -rf $MNT_LXC/lost+found
+lxc storage create $LXC_NAME dir source=$MNT_LXC
+}
+
+install_container() {
+res=`lxc list | grep $LXC_NAME`
+if [[ -n "$res" ]]; then
+	echo "Container exists! Uninstall it!"
+	exit 1
+fi
+if [[ -f "$IMG_USER" ]]; then
+    echo "Image user file exists!"
+    exit 2
+fi
+if [[ -f "$IMG_LXC" ]]; then
+    echo "Image file exist!"
+    exit 3
+fi
+echo "Creating storage ..."
+create_storage
+echo "Launc and configure container ..."
+launch_container
+}
+
+launch_container() {
+lxc launch -s $LXC_NAME -p $LXC_PROFILE $LXC_IMAGE $LXC_NAME
+lxc config set $LXC_NAME raw.idmap "$RAW_IDMAP"
+lxc config set $LXC_NAME boot.autostart="false"
+lxc config set $LXC_NAME limits.cpu="1"
+lxc config set $LXC_NAME limits.cpu.allowance=30%
+lxc config set $LXC_NAME limits.memory=1024MB
+lxc config set $LXC_NAME limits.memory.enforce=hard
+lxc config set $LXC_NAME limits.memory.swap="false"
+lxc config set $LXC_NAME limits.memory.swap.priority="0"
+lxc config device add $LXC_NAME user disk source=$MNT_LXC.user path=/home/${USER_CNT}
+lxc config device set $LXC_NAME root limits.read=10MB
+lxc config device set $LXC_NAME root limits.write=10MB
+lxc config device set $LXC_NAME user limits.read=10MB
+lxc config device set $LXC_NAME user limits.write=10MB
+[[ -n "$ENABLE_GPU" ]] && enable_gpu
+[[ -n "$ENABLE_NET" ]] && enable_net
+[[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo
+lxc config set $LXC_NAME environment.QT_X11_NO_MITSHM="1"
+lxc restart $LXC_NAME
+[[ -n "${USER_CNT}" ]] && create_user
+[[ -n "$ENABLE_X" ]] && enable_x
+[[ -n "$ENABLE_PULSE" ]] && enable_pulse
+[[ -n "$CONNECT_NET" ]] && connect_net
+[[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo_apt
+}
+
+apply_fix() {
+lxc config set $LXC_NAME environment.QT_X11_NO_MITSHM="1"
+}
+
+install_packages() {
+[[ -n "$ENABLE_X" ]] && [[ -n "$X_PACKAGES" ]] && lxc exec $LXC_NAME bash <<EOSH
+apt -y update && apt -y upgrade
+EOSH
+
+[[ -n "$ENABLE_CONTRIB_NONFREE" ]] && lxc exec $LXC_NAME bash <<EOSH
+echo "deb http://deb.debian.org/debian buster-backports main contrib non-free" >> /etc/apt/sources.list
+echo "#deb http://deb.debian.org/debian buster-backports-sloppy main contrib non-free" >> /etc/apt/sources.list
+EOSH
+
+[[ -n "$COMMON_PACKAGES" ]] && lxc exec $LXC_NAME bash <<EOSH
+apt -y install $COMMON_PACKAGES
+EOSH
+
+[[ -n "$ENABLE_X" ]] && [[ -n "$X_PACKAGES" ]] && lxc exec $LXC_NAME bash <<EOSH
+apt -y install $X_PACKAGES
+EOSH
+
+[[ -n "$ENABLE_PULSE" ]] && lxc exec $LXC_NAME bash <<EOSH
+apt -y install $PULSE_PACKAGES
+EOSH
+
+[[ -n "$ADDON_PACKAGES" ]] && lxc exec $LXC_NAME bash <<EOSH
+apt -y install $ADDON_PACKAGES
+EOSH
+}
+
+adjust_settings() {
+[[ -n "$HOST_NAME" ]] && set_hostname $HOST_NAME
+[[ -n "$TIME_ZONE" ]] && set_timezone $TIME_ZONE
+}
+
+stop() {
+    lxc stop $LXC_NAME
+}
+
+uninstall() {
+    stop
+    disconnect_net
+    lxc delete $LXC_NAME
+    lxc storage delete $LXC_NAME
+    umount $IMG_LXC
+    umount $IMG_USER
+    rm -f $IMG_LXC
+    rm -f $IMG_USER
+    rm -rf $MNT_LXC
+    rm -rf $MNT_LXC
+}
+
+reinstall() {
+    uninstall
+    install_container
+}
+
+lxc_config() {
+	lxc config edit $LXC_NAME
+}
+
+create_user() {
+lxc exec $LXC_NAME bash <<EOSH
+userdel ${USER_CNT}
+groupdel ${USER_CNT}
+groupadd -g ${GID_CNT} ${USER_CNT}
+useradd -u ${UID_CNT} -g ${GID_CNT} -m -d /home/${USER_CNT} -s /bin/bash ${USER_CNT}
+EOSH
+}
+
+reconfigure() {
+    c=`lxc list | grep STOPPED | grep $LXC_NAME`
+    [[ -n "$ENABLE_X" ]] && enable_x
+    [[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo 
+    [[ -n "$ENABLE_NET" ]] && enable_net
+    [[ -z "$ENABLE_LOCAL_REPO" ]] && disable_local_repo
+    [[ -z "$ENABLE_NET" ]] && disable_net
+    [[ -n "$ENABLE_X" ]] && xhost +
+    [[ -z "$c" ]] && lxc start $LXC_NAME
+    [[ -n "$ENABLE_LOCAL_REPO" ]] && enable_local_repo_apt
+    [[ -n "$ENABLE_GPU" ]] && enable_gpu
+    [[ -n "$ENABLE_X" ]] && enable_x
+    [[ -n "$ENABLE_X" ]] && [[ -n "$X_PACKAGES" ]] && lxc exec $LXC_NAME "apt -y install $X_PACKAGES"
+    [[ -n "$ENABLE_PULSE" ]]  && enable_pulse
+    [[ -n "$ENABLE_PULSE" ]] && [[ -n "$PULSE_PACKAGES" ]] && lxc exec $LXC_NAME "apt -y install $X_PACKAGES"
+    [[ -n "$SET_HOSTNAME" ]] && lxc exec $LXC_NAME bash "hostnamectl set-hostname ${HOST_NAME}"
+    [[ -n "$TIME_ZONE" ]] && set_timezone $TIME_ZONE
+    [[ -z "$ENABLE_GPU" ]] && disable_gpu
+    [[ -z "$ENABLE_X" ]] && disable_x
+    [[ -z "$ENABLE_LOCAL_REPO" ]] && disable_local_repo
+    [[ -z "$ENABLE_NET" ]] && disable_net
+    [[ -n "$c" ]] && lxc stop $LXC_NAME
+}
+
+change_mac() {
+	disable_net
+	enable_net
+}
+
+set_hostname() {
+    lxc exec $LXC_NAME "hostnamectl set-hostname $1"
+    lxc exec $LXC_NAME reboot
+    sleep 3
+}
+
+set_bridge() {
+echo "[Match]" > /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Name=$NIC_NAME" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "[Network]" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+echo "Bridge=$1" >> /etc/systemd/network/lxc@$LXC_NAME.in.network
+networkctl reload
+lxc restart $LXC_NAME
+sleep 3
+networkctl renew $NIC_NAME
+sleep 2
+}
+
+temp_home() {
+lxc exec $LXC_NAME bash <<EOSH
+mkdir -p /run/home/${{USER_CNT}}
+chmod 075 /run/home/${{USER_CNT}}
+chown -R ${USER_CNT}:$USER_CONTAINRE /run/home/${USER_CNT}
+usermod -d /home/user/${USER_CNT} ${USER_CNT}
+EOSH
+}
+
+restore_temp_home() {
+    echo 1
+}
+
+start() {
+    c=`lxc list | grep STOPPED | grep $LXC_NAME`
+    if [ -z "$c" ]; then
+	echo "Container already started!"
+	exit 99
+    fi
+    lxc start $LXC_NAME
+}
+
+user() {
+[[ -n "$TEMP_HOME" ]] && temp_home
+lxc exec $LXC_NAME -- su ${USER_CNT}
+}
+
+root() {
+    lxc exec $LXC_NAME bash
+}
+
+mount_images() {
+	if [[ -f "$IMG_LCX" ]]; then
+		[[ ! -d "$MNT_LXC" ]] && mkdir -p $MNT_LXC
+		mount $IMG_LXC $MNT_LXC
+	fi
+        if [[ -f "$IMG_USER" ]]; then
+                [[ ! -d "$MNT_USER" ]] && mkdir -p $MNT_USER
+                mount $IMG_USER $MNT_USER
+        fi
+}
+
+case "$1" in
+    "install")
+        install_container
+        ;;
+    "uninstall")
+        uninstall
+        ;;
+    "start")
+        start
+        ;;
+    "stop")
+        stop
+        ;;
+    "reconfigure")
+        check
+        ;;
+    "user")
+	user
+	;;
+    "root")
+	root
+	;;
+    "enable-x")
+	enable_x
+	;;
+    "enable-pulse")
+	enable_pulse
+	;;
+    "disable-x")
+	disable_x
+	;;
+    "disable-pulse")
+	disable_pulse
+	;;
+    "enable-net")
+	enable_net
+	;;
+    "connect-net")
+	connect_net
+	;;
+    "disable-net")
+	disable_net
+	;;
+    "disconnect-net")
+	disconnect_net
+	;;
+    "config")
+	lxc_config
+	;;
+    "set-hostname")
+	set_hostname $3
+	;;
+    "set-timezone")
+	set_timezone $3
+	;;
+    "change-mac")
+	change_mac
+	;;
+    "set-bridge")
+	set_bridge $3
+	;;
+    "create-user")
+	create_user
+	;;
+    "get-name")
+	echo "$LXC_NAME"
+	;;
+    "temp-home")
+	temp_home
+	;;
+    "temp-home")
+	restore_temp_home
+	;;
+    "create-storage")
+	create_storage
+	;;
+    "launch-container")
+	launch_container
+	;;
+    "install-packages")
+	install_packages
+	;;
+    "install-profile")
+	install_profile
+	;;
+    "create_user")
+	create_user
+	;;
+    "apply-fix")
+	apply_fix
+	;;
+    "mount-images")
+	mount_images
+	;;
+    *)
+        echo "lxc-app-container install | uninstall | start | stop | check"
+        ;;
+esac
